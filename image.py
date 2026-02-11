@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -9,13 +10,21 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from PySide6 import QtGui
+
 
 def repo_root() -> Path:
     return Path(__file__).resolve().parent
 
 
 def default_loaded_dir() -> Path:
-    return repo_root() / "Loaded"
+    return repo_root() / "pypaper" / "Loaded"
+
+
+def loaded_path_for_slot(loaded_dir: Path, slot: int) -> Path:
+    if slot <= 0:
+        raise ValueError(f"Invalid slot: {slot}")
+    return loaded_dir / f"monitor_{slot}.png"
 
 
 def sha1_file(path: Path) -> str:
@@ -26,27 +35,43 @@ def sha1_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def copy_into_loaded(*, src: Path, loaded_dir: Path, theme: str, monitor: str) -> Path:
-    """Copy src into Loaded/<theme>/<monitor>/ and return destination path.
-
-    Destination file name is content-addressed (sha1 + extension) to avoid
-    collisions when two sources share a name.
-    """
+def write_png_atomic(*, src: Path, dest_png: Path) -> None:
+    """Convert src to PNG and atomically replace dest_png."""
 
     if not src.exists() or not src.is_file():
         raise FileNotFoundError(src)
 
-    digest = sha1_file(src)
-    ext = src.suffix.lower()
+    dest_png.parent.mkdir(parents=True, exist_ok=True)
 
-    dest_dir = loaded_dir / theme / monitor
-    dest_dir.mkdir(parents=True, exist_ok=True)
+    reader = QtGui.QImageReader(str(src))
+    img = reader.read()
+    if img.isNull():
+        raise RuntimeError(f"Failed to read image {src}: {reader.errorString()}")
 
-    dest = dest_dir / f"{digest}{ext}"
-    if not dest.exists():
-        shutil.copy2(src, dest)
+    tmp_path: Path | None = None
+    try:
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=dest_png.stem + ".",
+            suffix=".tmp",
+            dir=str(dest_png.parent),
+        )
+        os.close(fd)
+        tmp_path = Path(tmp_name)
 
-    return dest
+        writer = QtGui.QImageWriter(str(tmp_path), b"png")
+        if not writer.write(img):
+            raise RuntimeError(
+                f"Failed to write PNG {dest_png}: {writer.errorString()}"
+            )
+
+        os.replace(tmp_path, dest_png)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _run_hyprctl(args: list[str]) -> None:
@@ -68,21 +93,24 @@ def set_wallpaper_hyprpaper(*, monitor: str, path: Path) -> None:
     """
 
     abs_path = path.expanduser().resolve()
-    _run_hyprctl(["hyprpaper", "preload", str(abs_path)])
-    _run_hyprctl(["hyprpaper", "wallpaper", f"{monitor},{abs_path}"])
+    # Recent hyprpaper versions do not require preload.
+    # IPC syntax (wiki): hyprctl hyprpaper wallpaper "[mon], [path], [fit_mode]"
+    _run_hyprctl(["hyprpaper", "wallpaper", f"{monitor}, {abs_path}"])
 
 
 def load_state(state_path: Path) -> dict[str, Any]:
     if not state_path.exists():
-        return {"version": 1, "monitors": {}}
+        return {"version": 2, "mapping": {}, "monitors": {}}
 
     data = json.loads(state_path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
-        return {"version": 1, "monitors": {}}
+        return {"version": 2, "mapping": {}, "monitors": {}}
     if "monitors" not in data or not isinstance(data.get("monitors"), dict):
         data["monitors"] = {}
+    if "mapping" not in data or not isinstance(data.get("mapping"), dict):
+        data["mapping"] = {}
     if "version" not in data:
-        data["version"] = 1
+        data["version"] = 2
     return data
 
 
@@ -99,6 +127,7 @@ def record_assignment(
     state_path: Path,
     monitor: str,
     theme: str,
+    slot: int,
     source_path: Path,
     loaded_path: Path,
 ) -> None:
@@ -106,15 +135,42 @@ def record_assignment(
     monitors = state.setdefault("monitors", {})
     monitors[monitor] = {
         "theme": theme,
+        "slot": slot,
         "source_path": str(source_path),
         "loaded_path": str(loaded_path),
     }
     save_state(state_path, state)
 
 
+def get_mapping(state_path: Path) -> dict[str, int]:
+    try:
+        state = load_state(state_path)
+    except Exception:
+        return {}
+
+    raw = state.get("mapping")
+    if not isinstance(raw, dict):
+        return {}
+
+    out: dict[str, int] = {}
+    for k, v in raw.items():
+        if not isinstance(k, str) or not k:
+            continue
+        if isinstance(v, int) and v > 0:
+            out[k] = v
+    return out
+
+
+def set_mapping(state_path: Path, mapping: dict[str, int]) -> None:
+    state = load_state(state_path)
+    state["mapping"] = dict(mapping)
+    save_state(state_path, state)
+
+
 def apply_wallpaper(
     *,
     monitor: str,
+    slot: int,
     theme: str,
     src: Path,
     loaded_dir: Path | None = None,
@@ -123,17 +179,14 @@ def apply_wallpaper(
     loaded_dir = default_loaded_dir() if loaded_dir is None else loaded_dir
     state_path = (loaded_dir / "state.json") if state_path is None else state_path
 
-    loaded_path = copy_into_loaded(
-        src=src,
-        loaded_dir=loaded_dir,
-        theme=theme,
-        monitor=monitor,
-    )
+    loaded_path = loaded_path_for_slot(loaded_dir, slot)
+    write_png_atomic(src=src, dest_png=loaded_path)
     set_wallpaper_hyprpaper(monitor=monitor, path=loaded_path)
     record_assignment(
         state_path=state_path,
         monitor=monitor,
         theme=theme,
+        slot=slot,
         source_path=src,
         loaded_path=loaded_path,
     )
@@ -148,25 +201,23 @@ def _self_test(argv: list[str]) -> int:
 
         src_dir = tmp_loaded / "src"
         src_dir.mkdir(parents=True, exist_ok=True)
-        src = src_dir / "test.jpg"
-        src.write_bytes(b"pypaper-test")
 
-        dest = copy_into_loaded(
-            src=src,
-            loaded_dir=tmp_loaded,
-            theme="ThemeX",
-            monitor="MON-1",
-        )
-        assert dest.exists(), "copy_into_loaded did not create dest"
-        assert dest.read_bytes() == src.read_bytes(), "copied file contents differ"
-        assert dest.name.startswith(sha1_file(src)), (
-            "dest filename should start with sha1"
-        )
+        # Make a deterministic source image.
+        img = QtGui.QImage(64, 32, QtGui.QImage.Format.Format_ARGB32)
+        img.fill(QtGui.QColor("#336699"))
+        src = src_dir / "test.jpg"
+        assert img.save(str(src), "JPG"), "Failed to write test source JPG"
+
+        dest = loaded_path_for_slot(tmp_loaded, 1)
+        write_png_atomic(src=src, dest_png=dest)
+        assert dest.exists(), "write_png_atomic did not create dest"
+        assert dest.read_bytes().startswith(b"\x89PNG\r\n\x1a\n"), "dest is not PNG"
 
         record_assignment(
             state_path=tmp_state,
             monitor="MON-1",
             theme="ThemeX",
+            slot=1,
             source_path=src,
             loaded_path=dest,
         )
@@ -181,7 +232,7 @@ def _self_test(argv: list[str]) -> int:
         monitor = argv[2]
         theme = argv[3]
         src = Path(argv[4])
-        loaded_path = apply_wallpaper(monitor=monitor, theme=theme, src=src)
+        loaded_path = apply_wallpaper(monitor=monitor, slot=1, theme=theme, src=src)
         print(f"applied monitor={monitor} loaded_path={loaded_path}")
 
     return 0

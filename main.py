@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,8 +20,10 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parent
 
 
-def _theme_root() -> Path:
-    return _repo_root() / "pypaper"
+DATA_ROOT = Path(os.environ.get("PYPAPER_DATA_ROOT", str(_repo_root() / "pypaper")))
+THEME_ROOT = DATA_ROOT
+LOADED_DIR = DATA_ROOT / "Loaded"
+STATE_PATH = LOADED_DIR / "state.json"
 
 
 @dataclass(frozen=True)
@@ -77,6 +80,9 @@ class MonitorRow(QtWidgets.QWidget):
     @property
     def monitor_name(self) -> str:
         return self._monitor_name
+
+    def set_label_text(self, text: str) -> None:
+        self._label.setText(text)
 
     def clear(self) -> None:
         for btn in list(self._group.buttons()):
@@ -203,9 +209,10 @@ class WallpaperWindow(QtWidgets.QWidget):
         self._config = UiConfig()
         self._icons = IconProvider(thumb_size=self._config.thumb_size)
 
-        self._theme_root = _theme_root()
-        self._loaded_dir = image.default_loaded_dir()
-        self._state_path = self._loaded_dir / "state.json"
+        self._theme_root = THEME_ROOT
+        self._loaded_dir = LOADED_DIR
+        self._state_path = STATE_PATH
+        self._loaded_dir.mkdir(parents=True, exist_ok=True)
 
         self._themes = theme.list_themes(self._theme_root)
         self._monitors = monitor.get_monitors()
@@ -217,9 +224,13 @@ class WallpaperWindow(QtWidgets.QWidget):
         self._theme_combo.addItems(self._themes)
         self._theme_combo.currentTextChanged.connect(self._on_theme_changed)
 
+        self._mapping_btn = QtWidgets.QPushButton("Mapping...")
+        self._mapping_btn.clicked.connect(self._open_mapping_dialog)
+
         top = QtWidgets.QHBoxLayout()
         top.addWidget(QtWidgets.QLabel("Theme:"))
         top.addWidget(self._theme_combo)
+        top.addWidget(self._mapping_btn)
         top.addStretch(1)
 
         self._rows_container = QtWidgets.QWidget()
@@ -240,6 +251,7 @@ class WallpaperWindow(QtWidgets.QWidget):
 
         self._rows: dict[str, MonitorRow] = {}
         self._build_rows()
+        self._refresh_row_labels()
         self._rebuild_buttons()
 
         if not self._themes:
@@ -260,6 +272,18 @@ class WallpaperWindow(QtWidgets.QWidget):
 
     def _current_theme(self) -> str:
         return self._theme_combo.currentText().strip()
+
+    def _mapping(self) -> dict[str, int]:
+        return image.get_mapping(self._state_path)
+
+    def _refresh_row_labels(self) -> None:
+        mapping = self._mapping()
+        for mon_name, row in self._rows.items():
+            slot = mapping.get(mon_name)
+            if isinstance(slot, int) and slot > 0:
+                row.set_label_text(f"{mon_name} -> monitor_{slot}.png")
+            else:
+                row.set_label_text(f"{mon_name} (unmapped)")
 
     def _checked_source_for(self, monitor_name: str, theme_name: str) -> Path | None:
         try:
@@ -295,16 +319,37 @@ class WallpaperWindow(QtWidgets.QWidget):
     def _on_theme_changed(self, _theme_name: str) -> None:
         self._rebuild_buttons()
 
+    @QtCore.Slot()
+    def _open_mapping_dialog(self) -> None:
+        dlg = MappingDialog(
+            monitors=self._monitors,
+            loaded_dir=self._loaded_dir,
+            state_path=self._state_path,
+            parent=self,
+        )
+        if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            self._refresh_row_labels()
+
     @QtCore.Slot(str, str)
     def _on_image_clicked(self, monitor_name: str, image_path: str) -> None:
         theme_name = self._current_theme()
         if not theme_name:
             return
 
+        mapping = self._mapping()
+        slot = mapping.get(monitor_name)
+        if not isinstance(slot, int) or slot <= 0:
+            self._open_mapping_dialog()
+            mapping = self._mapping()
+            slot = mapping.get(monitor_name)
+            if not isinstance(slot, int) or slot <= 0:
+                return
+
         src = Path(image_path)
         try:
             loaded_path = image.apply_wallpaper(
                 monitor=monitor_name,
+                slot=slot,
                 theme=theme_name,
                 src=src,
                 loaded_dir=self._loaded_dir,
@@ -320,6 +365,195 @@ class WallpaperWindow(QtWidgets.QWidget):
             return
 
         LOG.info("Applied wallpaper monitor=%s path=%s", monitor_name, loaded_path)
+
+
+class MappingDialog(QtWidgets.QDialog):
+    def __init__(
+        self,
+        *,
+        monitors: list[str],
+        loaded_dir: Path,
+        state_path: Path,
+        parent: QtWidgets.QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Monitor mapping")
+        self.setModal(True)
+
+        self._monitors = list(monitors)
+        self._loaded_dir = loaded_dir
+        self._state_path = state_path
+        self._slot_max = max(1, len(self._monitors))
+
+        self._error = QtWidgets.QLabel("")
+        self._error.setStyleSheet("color: #b91c1c;")
+
+        self._table = QtWidgets.QTableWidget(len(self._monitors), 3)
+        self._table.setHorizontalHeaderLabels(["Monitor", "Slot", "File"])
+        self._table.verticalHeader().setVisible(False)
+        self._table.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.NoSelection
+        )
+        self._table.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.setAlternatingRowColors(True)
+
+        self._slot_boxes: dict[str, QtWidgets.QComboBox] = {}
+
+        existing = image.get_mapping(self._state_path)
+        for row, mon in enumerate(self._monitors):
+            mon_item = QtWidgets.QTableWidgetItem(mon)
+            self._table.setItem(row, 0, mon_item)
+
+            slot_box = QtWidgets.QComboBox()
+            slot_box.addItem("")
+            for i in range(1, self._slot_max + 1):
+                slot_box.addItem(str(i))
+
+            slot = existing.get(mon)
+            if isinstance(slot, int) and 1 <= slot <= self._slot_max:
+                slot_box.setCurrentText(str(slot))
+
+            slot_box.currentTextChanged.connect(self._on_slots_changed)
+            self._slot_boxes[mon] = slot_box
+            self._table.setCellWidget(row, 1, slot_box)
+
+            file_item = QtWidgets.QTableWidgetItem("")
+            self._table.setItem(row, 2, file_item)
+
+        self._autofill = QtWidgets.QPushButton("Auto-fill")
+        self._autofill.clicked.connect(self._on_autofill)
+        self._clear = QtWidgets.QPushButton("Clear")
+        self._clear.clicked.connect(self._on_clear)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        self._ok_btn = buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok)
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+
+        tools = QtWidgets.QHBoxLayout()
+        tools.addWidget(self._autofill)
+        tools.addWidget(self._clear)
+        tools.addStretch(1)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+        layout.addWidget(
+            QtWidgets.QLabel(
+                f"Assign a slot (1..{self._slot_max}) to each monitor. Slots must be unique."
+            )
+        )
+        layout.addLayout(tools)
+        layout.addWidget(self._table, 1)
+        layout.addWidget(self._error)
+        layout.addWidget(buttons)
+
+        self._on_slots_changed()
+
+    def _row_for_monitor(self, monitor_name: str) -> int:
+        try:
+            return self._monitors.index(monitor_name)
+        except ValueError:
+            return -1
+
+    def _set_row_highlight(self, row: int, *, bad: bool) -> None:
+        if row < 0:
+            return
+        color = QtGui.QColor("#fee2e2") if bad else QtGui.QColor("#00000000")
+        for col in (0, 2):
+            item = self._table.item(row, col)
+            if item is not None:
+                item.setBackground(color)
+        slot_box = self._table.cellWidget(row, 1)
+        if isinstance(slot_box, QtWidgets.QComboBox):
+            if bad:
+                slot_box.setStyleSheet("QComboBox { background: #fee2e2; }")
+            else:
+                slot_box.setStyleSheet("")
+
+    @QtCore.Slot()
+    def _on_autofill(self) -> None:
+        for i, mon in enumerate(self._monitors, start=1):
+            self._slot_boxes[mon].setCurrentText(str(i))
+
+    @QtCore.Slot()
+    def _on_clear(self) -> None:
+        for mon in self._monitors:
+            self._slot_boxes[mon].setCurrentText("")
+
+    @QtCore.Slot()
+    def _on_slots_changed(self) -> None:
+        # Update file column and validate.
+        selected: dict[str, int] = {}
+        duplicates: set[str] = set()
+        used: dict[int, str] = {}
+        missing: set[str] = set()
+
+        for mon in self._monitors:
+            txt = self._slot_boxes[mon].currentText().strip()
+            if not txt:
+                missing.add(mon)
+                continue
+            try:
+                slot = int(txt)
+            except ValueError:
+                missing.add(mon)
+                continue
+            if not (1 <= slot <= self._slot_max):
+                missing.add(mon)
+                continue
+
+            if slot in used:
+                duplicates.add(mon)
+                duplicates.add(used[slot])
+            else:
+                used[slot] = mon
+            selected[mon] = slot
+
+        for mon in self._monitors:
+            row = self._row_for_monitor(mon)
+            file_item = self._table.item(row, 2)
+            slot = selected.get(mon)
+            if file_item is not None:
+                if slot is None:
+                    file_item.setText("(unset)")
+                else:
+                    file_item.setText(str(self._loaded_dir / f"monitor_{slot}.png"))
+
+            bad = (mon in missing) or (mon in duplicates)
+            self._set_row_highlight(row, bad=bad)
+
+        if duplicates:
+            self._error.setText("Slots must be unique.")
+            self._ok_btn.setEnabled(False)
+            return
+        if missing:
+            self._error.setText("Every monitor must have a slot.")
+            self._ok_btn.setEnabled(False)
+            return
+
+        self._error.setText("")
+        self._ok_btn.setEnabled(True)
+
+    @QtCore.Slot()
+    def _on_accept(self) -> None:
+        self._on_slots_changed()
+        if not self._ok_btn.isEnabled():
+            return
+
+        mapping: dict[str, int] = {}
+        for mon in self._monitors:
+            txt = self._slot_boxes[mon].currentText().strip()
+            mapping[mon] = int(txt)
+
+        image.set_mapping(self._state_path, mapping)
+        self.accept()
 
 
 def main(argv: list[str]) -> int:
