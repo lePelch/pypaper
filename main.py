@@ -216,6 +216,7 @@ class WallpaperWindow(QtWidgets.QWidget):
 
         self._themes = theme.list_themes(self._theme_root)
         self._monitors = monitor.get_monitors()
+        self._sort_monitors()
 
         self._theme_combo = QtWidgets.QComboBox()
         self._theme_combo.setSizeAdjustPolicy(
@@ -270,6 +271,29 @@ class WallpaperWindow(QtWidgets.QWidget):
 
         self._rows_layout.addStretch(1)
 
+    def _clear_rows(self) -> None:
+        while self._rows_layout.count():
+            item = self._rows_layout.takeAt(0)
+            if item is None:
+                break
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+
+        self._rows.clear()
+
+    def _sort_monitors(self) -> None:
+        mapping = self._mapping()
+
+        def key(name: str) -> tuple[int, int, str]:
+            slot = mapping.get(name)
+            if isinstance(slot, int) and slot > 0:
+                return (0, slot, "")
+            return (1, 0, name.casefold())
+
+        self._monitors.sort(key=key)
+
     def _current_theme(self) -> str:
         return self._theme_combo.currentText().strip()
 
@@ -281,9 +305,9 @@ class WallpaperWindow(QtWidgets.QWidget):
         for mon_name, row in self._rows.items():
             slot = mapping.get(mon_name)
             if isinstance(slot, int) and slot > 0:
-                row.set_label_text(f"{mon_name} -> monitor_{slot}.png")
+                row.set_label_text(f"Monitor {slot}")
             else:
-                row.set_label_text(f"{mon_name} (unmapped)")
+                row.set_label_text("Monitor (unmapped)")
 
     def _checked_source_for(self, monitor_name: str, theme_name: str) -> Path | None:
         try:
@@ -328,7 +352,11 @@ class WallpaperWindow(QtWidgets.QWidget):
             parent=self,
         )
         if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            self._sort_monitors()
+            self._clear_rows()
+            self._build_rows()
             self._refresh_row_labels()
+            self._rebuild_buttons()
 
     @QtCore.Slot(str, str)
     def _on_image_clicked(self, monitor_name: str, image_path: str) -> None:
