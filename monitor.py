@@ -7,13 +7,22 @@ import sys
 from collections.abc import Sequence
 
 
+HYPRCTL_MONITORS_TIMEOUT_S = 2.0
+
+
 def _run_hyprctl_json(args: Sequence[str]) -> object:
-    proc = subprocess.run(
-        ["hyprctl", *args],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        proc = subprocess.run(
+            ["hyprctl", *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=HYPRCTL_MONITORS_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(
+            f"hyprctl timed out after {HYPRCTL_MONITORS_TIMEOUT_S}s"
+        ) from e
     if proc.returncode != 0:
         raise RuntimeError(
             proc.stderr.strip() or proc.stdout.strip() or "hyprctl failed"
@@ -24,7 +33,9 @@ def _run_hyprctl_json(args: Sequence[str]) -> object:
         raise RuntimeError(f"Invalid JSON from hyprctl: {e}") from e
 
 
-def get_monitors(*, prefer_hyprctl: bool = True) -> list[str]:
+def get_monitors(
+    *, prefer_hyprctl: bool = True, allow_qt_fallback: bool = True
+) -> list[str]:
     """Return a list of monitor names.
 
     Prefer Hyprland (hyprctl) when available. Falls back to Qt screen names.
@@ -52,6 +63,9 @@ def get_monitors(*, prefer_hyprctl: bool = True) -> list[str]:
                     names.append(name)
                 if names:
                     return names
+
+    if not allow_qt_fallback:
+        return []
 
     # Fallback: Qt screen list.
     try:

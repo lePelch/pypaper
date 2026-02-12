@@ -3,8 +3,10 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Callable
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -14,6 +16,66 @@ import theme
 
 
 LOG = logging.getLogger(__name__)
+
+
+class _FnWorker(QtCore.QObject):
+    result = QtCore.Signal(object)
+    error = QtCore.Signal(object)
+    finished = QtCore.Signal()
+
+    def __init__(
+        self,
+        fn: Callable[[], object],
+        *,
+        parent: QtCore.QObject | None = None,
+    ):
+        super().__init__(parent)
+        self._fn = fn
+
+    @QtCore.Slot()
+    def run(self) -> None:
+        try:
+            out = self._fn()
+        except Exception as e:
+            self.error.emit({"message": str(e), "traceback": traceback.format_exc()})
+        else:
+            self.result.emit(out)
+        finally:
+            self.finished.emit()
+
+
+class _UiCallbacks(QtCore.QObject):
+    def __init__(
+        self,
+        *,
+        on_result: Callable[[object], None] | None,
+        on_error: Callable[[dict[str, Any]], None] | None,
+        on_finished: Callable[[], None] | None,
+        parent: QtCore.QObject,
+    ):
+        super().__init__(parent)
+        self._on_result = on_result
+        self._on_error = on_error
+        self._on_finished = on_finished
+
+    @QtCore.Slot(object)
+    def handle_result(self, out: object) -> None:
+        if self._on_result is not None:
+            self._on_result(out)
+
+    @QtCore.Slot(object)
+    def handle_error(self, err: object) -> None:
+        if self._on_error is None:
+            return
+        if isinstance(err, dict):
+            self._on_error(err)
+        else:
+            self._on_error({"message": str(err)})
+
+    @QtCore.Slot()
+    def handle_finished(self) -> None:
+        if self._on_finished is not None:
+            self._on_finished()
 
 
 def _repo_root() -> Path:
@@ -215,8 +277,11 @@ class WallpaperWindow(QtWidgets.QWidget):
         self._loaded_dir.mkdir(parents=True, exist_ok=True)
 
         self._themes = theme.list_themes(self._theme_root)
-        self._monitors = monitor.get_monitors()
-        self._sort_monitors()
+        self._monitors: list[str] = []
+
+        self._threads: set[QtCore.QThread] = set()
+        self._workers: set[_FnWorker] = set()
+        self._busy = False
 
         self._theme_combo = QtWidgets.QComboBox()
         self._theme_combo.setSizeAdjustPolicy(
@@ -227,6 +292,7 @@ class WallpaperWindow(QtWidgets.QWidget):
 
         self._mapping_btn = QtWidgets.QPushButton("Mapping...")
         self._mapping_btn.clicked.connect(self._open_mapping_dialog)
+        self._mapping_btn.setEnabled(False)
 
         top = QtWidgets.QHBoxLayout()
         top.addWidget(QtWidgets.QLabel("Theme:"))
@@ -251,9 +317,13 @@ class WallpaperWindow(QtWidgets.QWidget):
         layout.addWidget(self._rows_scroll, 1)
 
         self._rows: dict[str, MonitorRow] = {}
-        self._build_rows()
-        self._refresh_row_labels()
-        self._rebuild_buttons()
+
+        self._loading = QtWidgets.QLabel("Loading monitors...")
+        self._loading.setStyleSheet("color: #6b7280;")
+        self._rows_layout.addWidget(self._loading)
+        self._rows_layout.addStretch(1)
+
+        self._start_load_monitors()
 
         if not self._themes:
             QtWidgets.QMessageBox.warning(
@@ -261,6 +331,98 @@ class WallpaperWindow(QtWidgets.QWidget):
                 "No themes",
                 f"No themes found under {self._theme_root}.",
             )
+
+    def _set_busy(self, busy: bool) -> None:
+        if self._busy == busy:
+            return
+        self._busy = busy
+
+        self._theme_combo.setEnabled(not busy)
+        # Mapping stays disabled until monitors are loaded.
+        self._mapping_btn.setEnabled((not busy) and bool(self._monitors))
+        self._rows_container.setEnabled(not busy)
+        if busy:
+            QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.BusyCursor)
+        else:
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+    def _run_in_thread(
+        self,
+        fn: Callable[[], object],
+        *,
+        on_result: Callable[[object], None] | None = None,
+        on_error: Callable[[dict[str, Any]], None] | None = None,
+        on_finished: Callable[[], None] | None = None,
+    ) -> None:
+        t = QtCore.QThread(self)
+        w = _FnWorker(fn)
+        self._workers.add(w)
+        w.moveToThread(t)
+
+        cb = _UiCallbacks(
+            on_result=on_result,
+            on_error=on_error,
+            on_finished=on_finished,
+            parent=self,
+        )
+
+        w.result.connect(cb.handle_result)
+        w.error.connect(cb.handle_error)
+        w.finished.connect(cb.handle_finished)
+
+        w.finished.connect(lambda: self._workers.discard(w))
+        w.finished.connect(t.quit)
+        w.finished.connect(w.deleteLater)
+        w.finished.connect(cb.deleteLater)
+        t.finished.connect(t.deleteLater)
+        t.finished.connect(lambda: self._threads.discard(t))
+
+        self._threads.add(t)
+        t.started.connect(w.run)
+        t.start()
+
+    def _start_load_monitors(self) -> None:
+        def load() -> list[str]:
+            return monitor.get_monitors(allow_qt_fallback=False)
+
+        self._run_in_thread(
+            load,
+            on_result=self._on_monitors_loaded,
+            on_error=self._on_monitors_failed,
+        )
+
+    @QtCore.Slot(object)
+    def _on_monitors_loaded(self, out: object) -> None:
+        names = list(out) if isinstance(out, list) else []
+        if not names:
+            # Qt fallback must run on the UI thread.
+            names = monitor.get_monitors(prefer_hyprctl=False)
+
+        self._monitors = names
+        self._sort_monitors()
+
+        self._clear_rows()
+        if not self._monitors:
+            msg = QtWidgets.QLabel("No monitors detected.")
+            msg.setStyleSheet("color: #6b7280;")
+            self._rows_layout.addWidget(msg)
+            self._rows_layout.addStretch(1)
+            self._mapping_btn.setEnabled(False)
+            return
+
+        self._build_rows()
+        self._refresh_row_labels()
+        self._rebuild_buttons()
+        self._mapping_btn.setEnabled(True)
+
+    @QtCore.Slot(object)
+    def _on_monitors_failed(self, err: object) -> None:
+        msg = "Failed to load monitors."
+        if isinstance(err, dict) and isinstance(err.get("message"), str):
+            msg = err["message"]
+        LOG.warning("Monitor load failed: %s", msg)
+        # Fallback: try Qt screens.
+        self._on_monitors_loaded([])
 
     def _build_rows(self) -> None:
         for name in self._monitors:
@@ -360,6 +522,9 @@ class WallpaperWindow(QtWidgets.QWidget):
 
     @QtCore.Slot(str, str)
     def _on_image_clicked(self, monitor_name: str, image_path: str) -> None:
+        if self._busy:
+            return
+
         theme_name = self._current_theme()
         if not theme_name:
             return
@@ -374,8 +539,25 @@ class WallpaperWindow(QtWidgets.QWidget):
                 return
 
         src = Path(image_path)
-        try:
-            loaded_path = image.apply_wallpaper(
+        self._apply_wallpaper_async(
+            monitor_name=monitor_name,
+            slot=slot,
+            theme_name=theme_name,
+            src=src,
+        )
+
+    def _apply_wallpaper_async(
+        self,
+        *,
+        monitor_name: str,
+        slot: int,
+        theme_name: str,
+        src: Path,
+    ) -> None:
+        self._set_busy(True)
+
+        def apply() -> Path:
+            return image.apply_wallpaper(
                 monitor=monitor_name,
                 slot=slot,
                 theme=theme_name,
@@ -383,16 +565,44 @@ class WallpaperWindow(QtWidgets.QWidget):
                 loaded_dir=self._loaded_dir,
                 state_path=self._state_path,
             )
-        except Exception as e:
-            LOG.exception("Failed to apply wallpaper")
+
+        def on_result(out: object) -> None:
+            try:
+                loaded_path = out if isinstance(out, Path) else Path(str(out))
+                LOG.info(
+                    "Applied wallpaper monitor=%s path=%s",
+                    monitor_name,
+                    loaded_path,
+                )
+                self._rebuild_buttons()
+            finally:
+                self._set_busy(False)
+
+        def on_error(err: dict[str, Any]) -> None:
+            self._set_busy(False)
+            msg = "Failed to apply wallpaper"
+            if isinstance(err.get("message"), str) and err["message"]:
+                msg = err["message"]
+            tb = err.get("traceback")
+            if isinstance(tb, str) and tb.strip():
+                LOG.error("Wallpaper apply traceback:\n%s", tb.rstrip())
+            LOG.error(
+                "Failed to apply wallpaper monitor=%s src=%s: %s",
+                monitor_name,
+                src,
+                msg,
+            )
             QtWidgets.QMessageBox.critical(
                 self,
                 "Failed to apply wallpaper",
-                f"Monitor: {monitor_name}\nImage: {src}\n\n{e}",
+                f"Monitor: {monitor_name}\nImage: {src}\n\n{msg}",
             )
-            return
 
-        LOG.info("Applied wallpaper monitor=%s path=%s", monitor_name, loaded_path)
+        self._run_in_thread(
+            apply,
+            on_result=on_result,
+            on_error=on_error,
+        )
 
 
 class MappingDialog(QtWidgets.QDialog):

@@ -13,6 +13,9 @@ from typing import Any
 from PySide6 import QtGui
 
 
+HYPRCTL_TIMEOUT_S = 4.0
+
+
 def repo_root() -> Path:
     return Path(__file__).resolve().parent
 
@@ -75,12 +78,16 @@ def write_png_atomic(*, src: Path, dest_png: Path) -> None:
 
 
 def _run_hyprctl(args: list[str]) -> None:
-    proc = subprocess.run(
-        ["hyprctl", *args],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        proc = subprocess.run(
+            ["hyprctl", *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=HYPRCTL_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"hyprctl timed out after {HYPRCTL_TIMEOUT_S}s") from e
     if proc.returncode != 0:
         msg = (proc.stderr or proc.stdout).strip() or "hyprctl failed"
         raise RuntimeError(msg)
@@ -205,8 +212,8 @@ def _self_test(argv: list[str]) -> int:
         # Make a deterministic source image.
         img = QtGui.QImage(64, 32, QtGui.QImage.Format.Format_ARGB32)
         img.fill(QtGui.QColor("#336699"))
-        src = src_dir / "test.jpg"
-        assert img.save(str(src), "JPG"), "Failed to write test source JPG"
+        src = src_dir / "test.png"
+        assert img.save(str(src)), "Failed to write test source PNG"
 
         dest = loaded_path_for_slot(tmp_loaded, 1)
         write_png_atomic(src=src, dest_png=dest)
