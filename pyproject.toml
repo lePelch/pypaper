@@ -1,9 +1,26 @@
 [project]
 name = "pypaper"
 version = "0.1.0"
-description = "Manage different wallpaper"
+description = "Wallpaper manager for Hyprland"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "pyside6>=6.10.2",
+]
+
+[project.scripts]
+pypaper = "pypaper_app.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["pypaper_app"]
+
+[dependency-groups]
+dev = [
+    "build>=1.4.0",
+    "hatchling>=1.28.0",
+    "installer>=0.7.0",
 ]
